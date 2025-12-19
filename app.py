@@ -1,5 +1,5 @@
 import streamlit as st
-import fitz
+import fitz  # PyMuPDF
 import re
 import faiss
 import numpy as np
@@ -14,10 +14,10 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("📄 PDF Analyzer (Streamlit)")
-st.write("Ask questions directly from your PDF")
+st.title("📄 PDF Analyzer")
+st.write("Ask questions directly from your PDF (syllabus, notes, documents)")
 
-# ---------------- MODELS ----------------
+# ---------------- LOAD MODELS (CACHED) ----------------
 @st.cache_resource
 def load_models():
     embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
@@ -47,14 +47,18 @@ if "faiss_index" not in st.session_state:
 if "full_text" not in st.session_state:
     st.session_state.full_text = ""
 
-# ---------------- PDF LOADING ----------------
+# ---------------- PDF UPLOAD ----------------
 uploaded_pdf = st.file_uploader("Upload a PDF", type=["pdf"])
 
 if uploaded_pdf and st.button("Load PDF"):
     pdf_chunks = []
     full_text = ""
 
-    doc = fitz.open(stream=uploaded_pdf.read(), filetype="pdf")
+    try:
+        doc = fitz.open(stream=uploaded_pdf.read(), filetype="pdf")
+    except Exception as e:
+        st.error(f"Could not open PDF: {e}")
+        st.stop()
 
     for page in doc:
         text = page.get_text()
@@ -62,13 +66,14 @@ if uploaded_pdf and st.button("Load PDF"):
             cleaned = re.sub(r"\s+", " ", text).strip()
             full_text += cleaned + " "
 
+            # ✅ Smaller chunks for syllabus-style PDFs
             paragraphs = re.split(r"\n{2,}", cleaned)
             for p in paragraphs:
-                if len(p.strip()) > 200:
+                if len(p.strip()) > 50:
                     pdf_chunks.append(p.strip())
 
     if not pdf_chunks:
-        st.error("No readable text found in PDF")
+        st.error("No readable text found in PDF.")
     else:
         vectors = embedder.encode(
             pdf_chunks,
@@ -83,7 +88,7 @@ if uploaded_pdf and st.button("Load PDF"):
         st.session_state.faiss_index = index
         st.session_state.full_text = full_text
 
-        st.success(f"PDF loaded successfully. {len(pdf_chunks)} chunks indexed.")
+        st.success(f"PDF loaded successfully. {len(pdf_chunks)} text chunks indexed.")
 
 # ---------------- QUESTION ANSWERING ----------------
 st.divider()
@@ -108,10 +113,11 @@ if st.button("Ask Question"):
             st.session_state.pdf_chunks[i] for i in idx[0]
         )
 
-        if confidence > 0.12:
+        # ✅ Lower threshold for structured documents
+        if confidence > 0.08:
             prompt = f"""
 You MUST answer strictly using the PDF content below.
-If the answer is not found, say "Not found in the document".
+If the answer is not present, say "Not found in the document".
 
 PDF Content:
 {context}
@@ -125,6 +131,6 @@ Answer:
             st.success("Answer from PDF:")
             st.write(answer)
         else:
-            st.warning("Low confidence from PDF. General answer:")
-            answer = run_llm(f"Answer concisely: {question}")
-            st.write(answer)
+            # ✅ Safe fallback: show closest PDF content
+            st.warning("Exact answer not found. Showing closest content from the PDF:")
+            st.write(context)
