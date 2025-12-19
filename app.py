@@ -1,5 +1,5 @@
 import streamlit as st
-import fitz  # PyMuPDF
+import fitz
 import re
 import faiss
 import numpy as np
@@ -9,15 +9,10 @@ from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
 # ---------------- PAGE CONFIG ----------------
-st.set_page_config(
-    page_title="PDF Analyzer",
-    layout="wide"
-)
-
+st.set_page_config(page_title="PDF Analyzer", layout="wide")
 st.title("📄 PDF Analyzer")
-st.write("Ask questions directly from your PDF (syllabus, notes, documents)")
 
-# ---------------- LOAD MODELS (CACHED) ----------------
+# ---------------- MODELS ----------------
 @st.cache_resource
 def load_models():
     embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
@@ -29,97 +24,89 @@ embedder, tokenizer, model = load_models()
 
 def run_llm(prompt):
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True)
-    outputs = model.generate(
-        **inputs,
-        max_new_tokens=256,
-        temperature=0.2,
-        do_sample=False
-    )
+    outputs = model.generate(**inputs, max_new_tokens=256)
     return tokenizer.decode(outputs[0], skip_special_tokens=True)
 
 # ---------------- SESSION STATE ----------------
-if "pdf_chunks" not in st.session_state:
-    st.session_state.pdf_chunks = []
+if "chunks" not in st.session_state:
+    st.session_state.chunks = []
 
-if "faiss_index" not in st.session_state:
-    st.session_state.faiss_index = None
+if "index" not in st.session_state:
+    st.session_state.index = None
 
-if "full_text" not in st.session_state:
-    st.session_state.full_text = ""
+if "raw_text" not in st.session_state:
+    st.session_state.raw_text = ""
 
-# ---------------- PDF UPLOAD ----------------
-uploaded_pdf = st.file_uploader("Upload a PDF", type=["pdf"])
+# ---------------- LOAD PDF ----------------
+uploaded_pdf = st.file_uploader("Upload PDF", type=["pdf"])
 
 if uploaded_pdf and st.button("Load PDF"):
-    pdf_chunks = []
-    full_text = ""
+    chunks = []
+    raw_text = ""
 
-    try:
-        doc = fitz.open(stream=uploaded_pdf.read(), filetype="pdf")
-    except Exception as e:
-        st.error(f"Could not open PDF: {e}")
-        st.stop()
+    doc = fitz.open(stream=uploaded_pdf.read(), filetype="pdf")
 
     for page in doc:
-        text = page.get_text()
-        if text:
-            cleaned = re.sub(r"\s+", " ", text).strip()
-            full_text += cleaned + " "
+        text = page.get_text("text")
+        text = re.sub(r"\s+", " ", text)
+        raw_text += text + " "
 
-            # ✅ Smaller chunks for syllabus-style PDFs
-            paragraphs = re.split(r"\n{2,}", cleaned)
-            for p in paragraphs:
-                if len(p.strip()) > 50:
-                    pdf_chunks.append(p.strip())
+        # aggressive chunking
+        for chunk in re.split(r"(?<=\.) ", text):
+            if len(chunk) > 30:
+                chunks.append(chunk.strip())
 
-    if not pdf_chunks:
-        st.error("No readable text found in PDF.")
-    else:
-        vectors = embedder.encode(
-            pdf_chunks,
-            convert_to_numpy=True,
-            normalize_embeddings=True
-        ).astype("float32")
+    vectors = embedder.encode(
+        chunks,
+        convert_to_numpy=True,
+        normalize_embeddings=True
+    ).astype("float32")
 
-        index = faiss.IndexFlatIP(vectors.shape[1])
-        index.add(vectors)
+    index = faiss.IndexFlatIP(vectors.shape[1])
+    index.add(vectors)
 
-        st.session_state.pdf_chunks = pdf_chunks
-        st.session_state.faiss_index = index
-        st.session_state.full_text = full_text
+    st.session_state.chunks = chunks
+    st.session_state.index = index
+    st.session_state.raw_text = raw_text
 
-        st.success(f"PDF loaded successfully. {len(pdf_chunks)} text chunks indexed.")
+    st.success("PDF loaded and indexed successfully.")
 
-# ---------------- QUESTION ANSWERING ----------------
-st.divider()
-question = st.text_input("Ask a question from the PDF")
+# ---------------- ANSWER QUERY ----------------
+question = st.text_input("Ask a question")
 
-if st.button("Ask Question"):
-    if st.session_state.faiss_index is None:
-        st.warning("Please load a PDF first.")
-    elif question.strip() == "":
-        st.warning("Please enter a question.")
-    else:
-        q_vec = embedder.encode(
-            [question],
-            convert_to_numpy=True,
-            normalize_embeddings=True
-        ).astype("float32")
+if st.button("Ask"):
+    if st.session_state.index is None:
+        st.warning("Load a PDF first.")
+        st.stop()
 
-        scores, idx = st.session_state.faiss_index.search(q_vec, k=8)
-        confidence = float(scores[0][0])
+    q_lower = question.lower()
 
-        context = " ".join(
-            st.session_state.pdf_chunks[i] for i in idx[0]
-        )
+    # ✅ 1. KEYWORD SEARCH FIRST (CRITICAL FIX)
+    if "course outcome" in q_lower or "course outcomes" in q_lower:
+        matches = [
+            c for c in st.session_state.chunks
+            if "outcome" in c.lower()
+        ]
 
-        # ✅ Lower threshold for structured documents
-        if confidence > 0.08:
-            prompt = f"""
-You MUST answer strictly using the PDF content below.
-If the answer is not present, say "Not found in the document".
+        if matches:
+            st.success("Answer from PDF (keyword match):")
+            st.write(" ".join(matches[:5]))
+            st.stop()
 
-PDF Content:
+    # ✅ 2. SEMANTIC SEARCH
+    q_vec = embedder.encode(
+        [question],
+        convert_to_numpy=True,
+        normalize_embeddings=True
+    ).astype("float32")
+
+    scores, idx = st.session_state.index.search(q_vec, k=6)
+    context = " ".join(st.session_state.chunks[i] for i in idx[0])
+
+    prompt = f"""
+Use the context below to answer the question.
+
+Context:
 {context}
 
 Question:
@@ -127,10 +114,6 @@ Question:
 
 Answer:
 """
-            answer = run_llm(prompt)
-            st.success("Answer from PDF:")
-            st.write(answer)
-        else:
-            # ✅ Safe fallback: show closest PDF content
-            st.warning("Exact answer not found. Showing closest content from the PDF:")
-            st.write(context)
+    answer = run_llm(prompt)
+    st.success("Answer:")
+    st.write(answer)
