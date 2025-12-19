@@ -3,7 +3,6 @@ import fitz
 import re
 import faiss
 import numpy as np
-import torch
 
 from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
@@ -27,34 +26,33 @@ def run_llm(prompt):
     outputs = model.generate(**inputs, max_new_tokens=256)
     return tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-# ---------------- SESSION STATE ----------------
+# ---------------- SESSION ----------------
+if "raw_lines" not in st.session_state:
+    st.session_state.raw_lines = []
+
 if "chunks" not in st.session_state:
     st.session_state.chunks = []
 
 if "index" not in st.session_state:
     st.session_state.index = None
 
-if "raw_text" not in st.session_state:
-    st.session_state.raw_text = ""
-
 # ---------------- LOAD PDF ----------------
 uploaded_pdf = st.file_uploader("Upload PDF", type=["pdf"])
 
 if uploaded_pdf and st.button("Load PDF"):
+    raw_lines = []
     chunks = []
-    raw_text = ""
 
     doc = fitz.open(stream=uploaded_pdf.read(), filetype="pdf")
 
     for page in doc:
         text = page.get_text("text")
-        text = re.sub(r"\s+", " ", text)
-        raw_text += text + " "
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
+        raw_lines.extend(lines)
 
-        # aggressive chunking
-        for chunk in re.split(r"(?<=\.) ", text):
-            if len(chunk) > 30:
-                chunks.append(chunk.strip())
+        for l in lines:
+            if len(l) > 30:
+                chunks.append(l)
 
     vectors = embedder.encode(
         chunks,
@@ -65,13 +63,13 @@ if uploaded_pdf and st.button("Load PDF"):
     index = faiss.IndexFlatIP(vectors.shape[1])
     index.add(vectors)
 
+    st.session_state.raw_lines = raw_lines
     st.session_state.chunks = chunks
     st.session_state.index = index
-    st.session_state.raw_text = raw_text
 
     st.success("PDF loaded and indexed successfully.")
 
-# ---------------- ANSWER QUERY ----------------
+# ---------------- ANSWER ----------------
 question = st.text_input("Ask a question")
 
 if st.button("Ask"):
@@ -79,27 +77,35 @@ if st.button("Ask"):
         st.warning("Load a PDF first.")
         st.stop()
 
-    q_lower = question.lower()
+    q = question.lower()
 
-    # ✅ 1. KEYWORD SEARCH FIRST (CRITICAL FIX)
-    if "course outcome" in q_lower or "course outcomes" in q_lower:
-        matches = [
-            c for c in st.session_state.chunks
-            if "outcome" in c.lower()
-        ]
+    # ✅ SECTION-AWARE EXTRACTION (KEY FIX)
+    if "course outcome" in q or "course outcomes" in q:
+        lines = st.session_state.raw_lines
 
-        if matches:
-            st.success("Answer from PDF (keyword match):")
-            st.write(" ".join(matches[:5]))
+        section = []
+        capture = False
+
+        for line in lines:
+            if "course outcomes" in line.lower():
+                capture = True
+                section.append(line)
+                continue
+
+            if capture:
+                # Stop when a new section starts
+                if re.match(r"(unit\s*i|co-po|module|syllabus|course content)", line.lower()):
+                    break
+                section.append(line)
+
+        if section:
+            formatted = "\n".join(section)
+            st.success("Answer from PDF:")
+            st.text(formatted)
             st.stop()
 
-    # ✅ 2. SEMANTIC SEARCH
-    q_vec = embedder.encode(
-        [question],
-        convert_to_numpy=True,
-        normalize_embeddings=True
-    ).astype("float32")
-
+    # 🔹 FALLBACK: semantic search
+    q_vec = embedder.encode([question], convert_to_numpy=True, normalize_embeddings=True).astype("float32")
     scores, idx = st.session_state.index.search(q_vec, k=6)
     context = " ".join(st.session_state.chunks[i] for i in idx[0])
 
